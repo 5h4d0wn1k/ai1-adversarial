@@ -138,71 +138,197 @@ def generate_data(num_samples: int = 200, input_dim: int = 20,
     return x, y
 
 
-def main():
-    print("=" * 60)
-    print("  AI1 — Adversarial ML Attacks Demo")
-    print("=" * 60)
+class JSMAAttack:
+    """Jacobian-based Saliency Map Attack (Papernot et al., 2016).
 
-    input_dim = 20
-    num_classes = 5
-    model = SimpleModel(input_dim, num_classes)
+    Greedy feature modification using the model's Jacobian to build a
+    saliency map, perturbing the highest-saliency features toward the
+    target class, perturbing the highest positive-influence feature
+    each iteration.
+    """
 
-    x_clean, y_true = generate_data(num_samples=100, input_dim=input_dim,
-                                    num_classes=num_classes)
+    def __init__(self, model: SimpleModel, theta: float = 0.1,
+                 max_iterations: int = 40):
+        self.model = model
+        self.theta = theta
+        self.max_iterations = max_iterations
 
-    print(f"\nModel: {input_dim}D input, {num_classes} classes")
-    print(f"Samples: {len(x_clean)}")
+    def _jacobian(self, x: np.ndarray) -> np.ndarray:
+        # d out_k / d x_i for a linear softmax model:
+        #   out_k = softmax(x @ W)[k]
+        #   d out_k / d x_i = W[i,k] * p_k * (1 - p_k)
+        probs = self.model.forward(x.reshape(1, -1))[0]
+        scale = probs * (1.0 - probs)
+        return self.model.weights * scale
+
+    def _saliency_map(self, x: np.ndarray, target: int) -> np.ndarray:
+        jac = self._jacobian(x)
+        alpha = jac[:, target]          # influence toward target class
+        others = [k for k in range(jac.shape[1]) if k != target]
+        beta = jac[:, others].sum(axis=1)  # influence toward other classes
+        saliency = np.zeros(len(x))
+        for i in range(len(x)):
+            if alpha[i] > 0 and beta[i] < 0:
+                saliency[i] = abs(alpha[i] * beta[i])
+            else:
+                saliency[i] = -abs(alpha[i] * beta[i])
+        return saliency
+
+    def attack(self, x: np.ndarray, target: int) -> np.ndarray:
+        x_adv = x.copy()
+        for _ in range(self.max_iterations):
+            if self.model.predict(x_adv.reshape(1, -1))[0] == target:
+                break
+            saliency = self._saliency_map(x_adv, target)
+            feature = int(np.argmax(saliency))
+            change = self.theta if saliency[feature] > 0 else -self.theta
+            x_adv[feature] = np.clip(x_adv[feature] + change, 0.0, 1.0)
+        return x_adv
+
+    def batch_attack(self, x_batch: np.ndarray, y_batch: np.ndarray) -> np.ndarray:
+        results = []
+        for i in range(len(x_batch)):
+            target = int((y_batch[i] + 1) % max(2, int(np.max(y_batch) + 1)))
+            results.append(self.attack(x_batch[i], target))
+        return np.array(results)
+
+
+def run_experiment(num_samples: int = 100, input_dim: int = 20,
+                   num_classes: int = 5, seed: int = 42) -> dict:
+    """Run the full adversarial ML experiment and return structured results."""
+    model = SimpleModel(input_dim, num_classes, seed=seed)
+
+    x_clean, y_true = generate_data(num_samples=num_samples, input_dim=input_dim,
+                                    num_classes=num_classes, seed=seed)
 
     pred_clean = model.predict(x_clean)
-    clean_acc = np.mean(pred_clean == y_true)
-    print(f"Clean accuracy: {clean_acc:.2%}")
+    clean_acc = float(np.mean(pred_clean == y_true))
 
-    print("\n--- FGSM Attack ---")
     fgsm = FGSMAttack(model, epsilon=0.1)
     x_fgsm = fgsm.batch_attack(x_clean, y_true)
     ev_fgsm = AdversarialEvaluator(model).evaluate(x_clean, y_true, x_fgsm)
-    for k, v in ev_fgsm.items():
-        print(f"  {k}: {v:.4f}")
 
-    print("\n--- PGD Attack ---")
     pgd = PGDAttack(model, epsilon=0.1, alpha=0.01, num_steps=40)
     x_pgd = pgd.batch_attack(x_clean, y_true)
     ev_pgd = AdversarialEvaluator(model).evaluate(x_clean, y_true, x_pgd)
-    for k, v in ev_pgd.items():
-        print(f"  {k}: {v:.4f}")
 
-    print("\n--- Single Example ---")
+    jsma = JSMAAttack(model, theta=0.1, max_iterations=60)
+    x_jsma = jsma.batch_attack(x_clean, y_true)
+    ev_jsma = AdversarialEvaluator(model).evaluate(x_clean, y_true, x_jsma)
+
     idx = 0
     x_single = x_clean[idx]
     y_single = int(y_true[idx])
-    print(f"True label: {y_single}")
-    pred_before = model.predict(x_single.reshape(1, -1))[0]
-    print(f"Prediction before attack: {pred_before}")
-
+    pred_before = int(model.predict(x_single.reshape(1, -1))[0])
     x_adv_fgsm = fgsm.attack(x_single, y_single)
-    pred_fgsm = model.predict(x_adv_fgsm.reshape(1, -1))[0]
-    print(f"Prediction after FGSM:    {pred_fgsm}")
-    print(f"Perturbation L2:          {np.sqrt(np.sum((x_adv_fgsm - x_single)**2)):.4f}")
-    print(f"Perturbation Linf:        {np.max(np.abs(x_adv_fgsm - x_single)):.4f}")
-
+    pred_fgsm = int(model.predict(x_adv_fgsm.reshape(1, -1))[0])
     x_adv_pgd = pgd.attack(x_single, y_single)
-    pred_pgd = model.predict(x_adv_pgd.reshape(1, -1))[0]
-    print(f"Prediction after PGD:     {pred_pgd}")
-    print(f"Perturbation L2:          {np.sqrt(np.sum((x_adv_pgd - x_single)**2)):.4f}")
-    print(f"Perturbation Linf:        {np.max(np.abs(x_adv_pgd - x_single)):.4f}")
+    pred_pgd = int(model.predict(x_adv_pgd.reshape(1, -1))[0])
 
-    print("\n--- Robustness Comparison ---")
     evaluator = AdversarialEvaluator(model)
+    eps_table = {}
     epsilons = [0.05, 0.1, 0.15, 0.2]
     for eps in epsilons:
         f = FGSMAttack(model, epsilon=eps)
         p = PGDAttack(model, epsilon=eps, alpha=eps / 4, num_steps=40)
         comparison = evaluator.compare_attacks(x_clean, y_true, {"FGSM": f, "PGD": p})
-        print(f"  eps={eps:.2f}  FGSM_acc={comparison['FGSM']['adversarial_accuracy']:.3f}"
-              f"  PGD_acc={comparison['PGD']['adversarial_accuracy']:.3f}")
+        eps_table[str(eps)] = {
+            "fgsm_accuracy": comparison["FGSM"]["adversarial_accuracy"],
+            "pgd_accuracy": comparison["PGD"]["adversarial_accuracy"],
+            "fgsm_attack_success": comparison["FGSM"]["attack_success_rate"],
+            "pgd_attack_success": comparison["PGD"]["attack_success_rate"],
+        }
 
-    print("\nDone.")
+    return {
+        "model": {
+            "input_dim": input_dim,
+            "num_classes": num_classes,
+            "samples": num_samples,
+            "seed": seed,
+            "clean_accuracy": clean_acc,
+        },
+        "attacks": {
+            "FGSM": ev_fgsm,
+            "PGD": ev_pgd,
+            "JSMA": ev_jsma,
+        },
+        "single_example": {
+            "true_label": y_single,
+            "prediction_before": pred_before,
+            "prediction_after_fgsm": pred_fgsm,
+            "prediction_after_pgd": pred_pgd,
+            "fgsm_perturbation_l2": float(np.sqrt(np.sum((x_adv_fgsm - x_single) ** 2))),
+            "fgsm_perturbation_linf": float(np.max(np.abs(x_adv_fgsm - x_single))),
+            "pgd_perturbation_l2": float(np.sqrt(np.sum((x_adv_pgd - x_single) ** 2))),
+            "pgd_perturbation_linf": float(np.max(np.abs(x_adv_pgd - x_single))),
+        },
+        "epsilon_comparison": eps_table,
+    }
+
+
+def format_report(results: dict) -> str:
+    lines = []
+    lines.append("=" * 60)
+    lines.append("  AI1 — Adversarial ML Attacks Demo")
+    lines.append("=" * 60)
+    model = results["model"]
+    lines.append(f"\nModel: {model['input_dim']}D input, {model['num_classes']} classes")
+    lines.append(f"Samples: {model['samples']}")
+    lines.append(f"Clean accuracy: {model['clean_accuracy']:.2%}")
+
+    for name in ("FGSM", "PGD", "JSMA"):
+        lines.append(f"\n--- {name} Attack ---")
+        for k, v in results["attacks"][name].items():
+            lines.append(f"  {k}: {v:.4f}")
+
+    lines.append("\n--- Single Example ---")
+    se = results["single_example"]
+    lines.append(f"True label: {se['true_label']}")
+    lines.append(f"Prediction before attack: {se['prediction_before']}")
+    lines.append(f"Prediction after FGSM:    {se['prediction_after_fgsm']}")
+    lines.append(f"Prediction after PGD:     {se['prediction_after_pgd']}")
+
+    lines.append("\n--- Robustness Comparison ---")
+    for eps, row in results["epsilon_comparison"].items():
+        lines.append(f"  eps={eps}  FGSM_acc={row['fgsm_accuracy']:.3f}"
+                     f"  PGD_acc={row['pgd_accuracy']:.3f}")
+    lines.append("\nDone.")
+    return "\n".join(lines)
+
+
+def main(argv=None):
+    import argparse
+    import json
+    import os
+
+    parser = argparse.ArgumentParser(
+        prog="ai1-adversarial",
+        description="Adversarial ML attacks on a small local NN (FGSM/PGD/JSMA). "
+                    "Offline, self-contained, numpy optional.")
+    parser.add_argument("--samples", type=int, default=100,
+                        help="number of synthetic samples per class space")
+    parser.add_argument("--dim", type=int, default=20, help="input dimensions")
+    parser.add_argument("--classes", type=int, default=5, help="number of classes")
+    parser.add_argument("--seed", type=int, default=42, help="RNG seed")
+    parser.add_argument("--output", metavar="FILE",
+                        help="write JSON report to FILE (e.g. reports/ai1-report.json)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="suppress human-readable output")
+    args = parser.parse_args(argv)
+
+    results = run_experiment(
+        num_samples=args.samples, input_dim=args.dim,
+        num_classes=args.classes, seed=args.seed)
+
+    if args.output:
+        out_dir = os.path.dirname(os.path.abspath(args.output))
+        os.makedirs(out_dir, exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as fh:
+            json.dump(results, fh, indent=2)
+    if not args.quiet:
+        print(format_report(results))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
